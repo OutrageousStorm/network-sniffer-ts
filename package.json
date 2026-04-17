@@ -1,0 +1,16 @@
+{
+  "name": "network-sniffer-ts",
+  "version": "0.1.0",
+  "description": "TypeScript network packet analyzer for Android PCAPdroid exports",
+  "main": "sniffer.ts",
+  "scripts": {
+    "start": "ts-node sniffer.ts",
+    "build": "tsc"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "ts-node": "^10.9.0",
+    "@types/node": "^20.0.0"
+  }
+}
