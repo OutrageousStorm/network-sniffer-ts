@@ -1,76 +1,94 @@
-// sniffer.ts - Packet analyzer for Android network traffic
-import * as child_process from 'child_process';
+import { spawn } from 'child_process';
+import { EventEmitter } from 'events';
 
 interface Packet {
-    timestamp: string;
-    protocol: string;
-    src: string;
-    dst: string;
-    port: number;
-    size: number;
-    flags?: string;
+  protocol: string;
+  source: string;
+  destination: string;
+  size: number;
+  timestamp: Date;
 }
 
-class NetworkSniffer {
-    packets: Packet[] = [];
-    
-    async captureWithTcpdump(duration: number = 30): Promise<void> {
-        console.log(`\n📡 Capturing traffic for ${duration}s...`);
-        const cmd = `adb shell tcpdump -i any -w /sdcard/capture.pcap & sleep ${duration}; killall tcpdump`;
-        child_process.execSync(cmd, { stdio: 'inherit' });
-        child_process.execSync('adb pull /sdcard/capture.pcap .', { stdio: 'inherit' });
+class NetworkSniffer extends EventEmitter {
+  private tcpdumpProcess: any = null;
+  private isRunning = false;
+
+  constructor() {
+    super();
+  }
+
+  /**
+   * Start sniffing network packets via ADB tcpdump
+   * @param filter Optional tcpdump filter (e.g., "tcp port 80")
+   * @param device Optional ADB device serial
+   */
+  start(filter = '', device = ''): void {
+    if (this.isRunning) {
+      console.log('Sniffer already running');
+      return;
     }
-    
-    parseNetstat(): Packet[] {
-        const result = child_process.execSync('adb shell netstat -tulnp 2>/dev/null || true', { encoding: 'utf-8' });
-        const packets: Packet[] = [];
-        
-        for (const line of result.split('\n')) {
-            if (line.includes('ESTABLISHED')) {
-                const match = line.match(/(\d+\.\d+\.\d+\.\d+):(\d+)/);
-                if (match) {
-                    packets.push({
-                        timestamp: new Date().toISOString(),
-                        protocol: line.includes('tcp') ? 'TCP' : 'UDP',
-                        src: match[1],
-                        dst: '',
-                        port: parseInt(match[2]),
-                        size: 0
-                    });
-                }
-            }
+
+    const adbCmd = device ? `adb -s ${device}` : 'adb';
+    const tcpdumpFilter = filter || 'tcp or udp';
+    const cmd = `${adbCmd} shell tcpdump -i any -n '${tcpdumpFilter}'`;
+
+    console.log(`🔍 Starting packet capture...`);
+    this.tcpdumpProcess = spawn('sh', ['-c', cmd]);
+    this.isRunning = true;
+
+    this.tcpdumpProcess.stdout.on('data', (data: Buffer) => {
+      const lines = data.toString().split('\n').filter((l: string) => l.trim());
+      for (const line of lines) {
+        const packet = this.parsePacket(line);
+        if (packet) {
+          this.emit('packet', packet);
         }
-        return packets;
+      }
+    });
+
+    this.tcpdumpProcess.stderr.on('data', (data: Buffer) => {
+      console.error('tcpdump error:', data.toString());
+    });
+  }
+
+  stop(): void {
+    if (this.tcpdumpProcess) {
+      this.tcpdumpProcess.kill();
+      this.isRunning = false;
+      console.log('✓ Packet capture stopped');
     }
-    
-    classifyTraffic(): Map<string, number> {
-        const classification = new Map<string, number>();
-        
-        for (const p of this.packets) {
-            let category = 'Other';
-            if ([443, 8443].includes(p.port)) category = 'HTTPS';
-            else if (p.port === 80) category = 'HTTP';
-            else if ([53, 5353].includes(p.port)) category = 'DNS';
-            else if (p.port === 22) category = 'SSH';
-            
-            classification.set(category, (classification.get(category) || 0) + 1);
-        }
-        return classification;
-    }
-    
-    report(): void {
-        console.log(`\n📊 Traffic Analysis (${this.packets.length} packets)`);
-        const classified = this.classifyTraffic();
-        for (const [category, count] of classified) {
-            console.log(`  ${category}: ${count}`);
-        }
-    }
+  }
+
+  private parsePacket(line: string): Packet | null {
+    // Example: "IP 192.168.1.100.54321 > 8.8.8.8.443: Flags [S], seq ..."
+    const match = line.match(/IP\s+([\w.]+)\.(\d+)\s+>\s+([\w.]+)\.(\d+)/);
+    if (!match) return null;
+
+    const [, source, , destination] = match;
+    const protocolMatch = line.match(/(tcp|udp|icmp)/i);
+    const protocol = protocolMatch ? protocolMatch[1].toUpperCase() : 'IP';
+
+    return {
+      protocol,
+      source,
+      destination,
+      size: line.length,
+      timestamp: new Date(),
+    };
+  }
 }
 
-async function main() {
-    const sniffer = new NetworkSniffer();
-    sniffer.packets = sniffer.parseNetstat();
-    sniffer.report();
-}
+// Usage example
+const sniffer = new NetworkSniffer();
 
-main().catch(console.error);
+sniffer.on('packet', (packet: Packet) => {
+  console.log(`📦 ${packet.protocol} ${packet.source} → ${packet.destination}`);
+});
+
+// Start sniffing TCP on port 443 (HTTPS)
+sniffer.start('tcp port 443');
+
+// Stop after 30 seconds
+setTimeout(() => sniffer.stop(), 30000);
+
+export default NetworkSniffer;
