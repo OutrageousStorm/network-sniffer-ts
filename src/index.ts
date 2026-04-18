@@ -1,107 +1,90 @@
-import * as pcap from "pcap";
-import chalk from "chalk";
+#!/usr/bin/env node
+/**
+ * network-sniffer-ts -- Capture and analyze network packets on Android
+ * Usage: npx ts-node src/index.ts --filter "8.8.8.8" --limit 50
+ */
 
-interface PacketInfo {
-    timestamp: Date;
-    srcIp: string;
-    dstIp: string;
-    protocol: string;
-    port: number;
-    size: number;
-    app?: string;
+import { execSync } from 'child_process';
+import { ArgumentParser } from 'argparse';
+
+interface Packet {
+  src: string;
+  dst: string;
+  proto: string;
+  size: number;
+  flags?: string;
 }
 
-export class NetworkSniffer {
-    private packets: PacketInfo[] = [];
+class AndroidSniffer {
+  private packets: Packet[] = [];
 
-    start(deviceIp?: string): void {
-        console.log(chalk.cyan("\n📡 Network Sniffer Started"));
-        console.log(chalk.dim("Listening for packets...\n"));
+  adb(cmd: string): string {
+    try {
+      return execSync(`adb shell ${cmd}`, { encoding: 'utf-8' }).trim();
+    } catch (e) {
+      return '';
+    }
+  }
 
-        const pcapSession = pcap.createSession("", {
-            filter: "ip",
-            buffer_size: 10 * 1024 * 1024,
-        });
+  start(duration: number = 10, filter?: string): void {
+    console.log(`\n📡 Capturing packets for ${duration}s...\n`);
+    const end_time = Date.now() + duration * 1000;
 
-        pcapSession.on("packet", (rawPacket: any) => {
-            try {
-                const packet = pcap.decode.packet(rawPacket);
-                if (packet.payload?.payload) {
-                    const info = this.parsePacket(packet);
-                    if (info) {
-                        this.packets.push(info);
-                        this.printPacket(info);
-                        if (this.packets.length % 50 === 0) {
-                            console.log(chalk.gray(`✓ Captured ${this.packets.length} packets`));
-                        }
-                    }
-                }
-            } catch (e) {
-                // Silently skip parse errors
-            }
-        });
+    // Parse netstat output repeatedly
+    while (Date.now() < end_time) {
+      const output = this.adb('netstat -tuln');
+      this.parseNetstat(output, filter);
+      process.stdout.write('.');
+    }
+    console.log('\n');
+    this.displayResults();
+  }
 
-        process.on("SIGINT", () => {
-            this.printSummary();
-            process.exit(0);
-        });
+  parseNetstat(output: string, filter?: string): void {
+    const lines = output.split('\n');
+    for (const line of lines) {
+      const match = line.match(/(\S+)\s+\d+\s+\d+\s+(\S+)\s+(\S+)\s+(\S+)/);
+      if (!match) continue;
+
+      const [, proto, recv_q, src, dst, state] = match;
+      if (filter && !src.includes(filter) && !dst.includes(filter)) continue;
+
+      this.packets.push({
+        src,
+        dst,
+        proto,
+        size: parseInt(recv_q) || 0,
+      });
+    }
+  }
+
+  displayResults(): void {
+    if (this.packets.length === 0) {
+      console.log('No packets captured.');
+      return;
     }
 
-    private parsePacket(packet: any): PacketInfo | null {
-        try {
-            const ipLayer = packet.payload;
-            const srcIp = ipLayer.saddr.addr.join(".");
-            const dstIp = ipLayer.daddr.addr.join(".");
-            
-            let protocol = "UNKNOWN";
-            let port = 0;
+    console.log(`\n${'Src':<25} ${'Dst':<25} ${'Proto':<8} ${'Size'}`);
+    console.log('─'.repeat(70));
 
-            if (ipLayer.protocol === 6) { // TCP
-                protocol = "TCP";
-                const tcpLayer = ipLayer.payload;
-                port = tcpLayer?.dport || 0;
-            } else if (ipLayer.protocol === 17) { // UDP
-                protocol = "UDP";
-                const udpLayer = ipLayer.payload;
-                port = udpLayer?.dport || 0;
-            }
-
-            return {
-                timestamp: new Date(),
-                srcIp,
-                dstIp,
-                protocol,
-                port,
-                size: ipLayer.total_length || 0,
-            };
-        } catch {
-            return null;
-        }
+    const seen = new Set<string>();
+    for (const pkt of this.packets) {
+      const key = `${pkt.src}→${pkt.dst}`;
+      if (!seen.has(key)) {
+        console.log(`${pkt.src:<25} ${pkt.dst:<25} ${pkt.proto:<8} ${pkt.size}`);
+        seen.add(key);
+      }
     }
 
-    private printPacket(info: PacketInfo): void {
-        const proto = chalk.yellow(info.protocol);
-        const ip = chalk.cyan(\`\${info.dstIp}\`);
-        const port = info.port > 0 ? chalk.gray(\`:\${info.port}\`) : "";
-        console.log(\`  \${proto} → \${ip}\${port} (\${info.size}B)\`);
-    }
-
-    private printSummary(): void {
-        const byProto = this.groupBy(this.packets, (p) => p.protocol);
-        console.log(chalk.bold("\n📊 Summary"));
-        console.log(chalk.dim("━".repeat(40)));
-        console.log(\`Total packets: \${this.packets.length}\`);
-        Object.entries(byProto).forEach(([proto, pkts]: [string, any]) => {
-            console.log(\`  \${proto}: \${pkts.length}\`);
-        });
-    }
-
-    private groupBy<T>(arr: T[], fn: (x: T) => string): Record<string, T[]> {
-        return arr.reduce((acc, x) => {
-            const key = fn(x);
-            if (!acc[key]) acc[key] = [];
-            acc[key].push(x);
-            return acc;
-        }, {} as Record<string, T[]>);
-    }
+    console.log(`\nTotal unique flows: ${seen.size}`);
+  }
 }
+
+const parser = new ArgumentParser({ description: 'Android network sniffer' });
+parser.add_argument('--duration', { type: 'int', default: 10, help: 'Capture duration in seconds' });
+parser.add_argument('--filter', { help: 'Filter by IP address' });
+parser.add_argument('--limit', { type: 'int', default: 50, help: 'Max packets to display' });
+
+const args = parser.parse_args();
+const sniffer = new AndroidSniffer();
+sniffer.start(args.duration, args.filter);
